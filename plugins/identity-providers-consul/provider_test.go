@@ -15,15 +15,19 @@
 package consul
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
-	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/greenpau/caddy-security/internal/consultest"
-	"github.com/greenpau/go-authcrunch/pkg/idp"
 	"net/http"
 	"net/url"
 	"sync"
 	"testing"
+
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/greenpau/go-authcrunch/pkg/identity/attachment"
+	"github.com/greenpau/go-authcrunch/pkg/idp"
+
+	"github.com/greenpau/caddy-security/internal/consultest"
 )
 
 func TestConsulTicketParser(t *testing.T) {
@@ -133,5 +137,121 @@ func TestConsulTicketProvider(t *testing.T) {
 	}
 	if _, err := b.Login(t.Context(), request("", nil)); err != nil {
 		t.Fatal("peer close lost shared client", err)
+	}
+}
+
+func TestConsulTicketClaimRetriesFailedAttachment(t *testing.T) {
+	address := consultest.Start(t)
+	binding := consultest.Binding(t, address, "ticket-attachment-recovery")
+	open := func(unbound bool) *Provider {
+		m := &ConsulTicketIdentityProvider{
+			Name:         "tickets",
+			Realm:        "application",
+			PublicOrigin: "https://auth.example.test",
+			IssuerURL:    "https://issuer.example.test/signin",
+			Capacity:     4,
+			binding:      binding,
+		}
+		if unbound {
+			m.Attachment = &attachment.Config{LocalIdentityStore: "accounts"}
+		}
+		if _, err := m.IdentityProviderConfig(); err != nil {
+			t.Fatal(err)
+		}
+		runtime, err := m.NewIdentityProvider(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := runtime.(*Provider)
+		t.Cleanup(func() { _ = p.Close() })
+		return p
+	}
+	winner := open(true)
+	peer, retry := open(false), open(false)
+	request := func(query string, cookie *http.Cookie) *http.Request {
+		u, _ := url.Parse(winner.CallbackURL() + query)
+		r := &http.Request{Method: http.MethodGet, URL: u, Host: u.Host, TLS: &tls.ConnectionState{}}
+		if cookie != nil {
+			r.Header = http.Header{}
+			r.AddCookie(cookie)
+		}
+		return r
+	}
+	begin, err := winner.Login(t.Context(), request("", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuer, _ := url.Parse(begin.RedirectURL)
+	state := issuer.Query().Get("request")
+	credential, err := peer.Issue(t.Context(), state, &idp.LoginIdentity{Subject: "subject-recover", Email: "alice@example.test", Name: "Alice", Roles: []string{"authp/user"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := "?" + (url.Values{"state": {state}, "ticket": {credential}}).Encode()
+	// The explicit attachment is intentionally unbound, so its first attempt
+	// fails after the winning browser has claimed the one-time ticket.
+	if result, err := winner.Login(t.Context(), request(query, begin.Cookie)); err == nil || result != nil {
+		t.Fatal("failed attachment published a successful login result")
+	}
+	digest := sha256.Sum256([]byte(state))
+	if err := winner.run(t.Context(), func(d *document) (bool, error) {
+		claimed, ok := d.Tickets[digest]
+		if !ok || !claimed.Consumed || !claimed.AttachmentFailed || claimed.Identity == nil || claimed.Identity.Subject != "subject-recover" {
+			t.Fatal("failed attachment did not retain the browser-owned retryable claim")
+		}
+		return false, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	otherBrowser, err := secret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result, err := winner.Login(t.Context(), request(query, &http.Cookie{Name: winner.config.CookieName, Value: otherBrowser})); !errors.Is(err, ErrDenied) || result != nil {
+		t.Fatal("another browser recovered the claimed ticket", err)
+	}
+	// Concurrent same-browser retries reclaim the failed claim atomically, so
+	// exactly one of them may publish the recovered authentication result.
+	type outcome struct {
+		result *idp.HTTPLoginResult
+		err    error
+	}
+	results := make(chan outcome, 2)
+	var wg sync.WaitGroup
+	for _, p := range []*Provider{peer, retry} {
+		wg.Add(1)
+		go func(p *Provider) {
+			defer wg.Done()
+			result, err := p.Login(t.Context(), request(query, begin.Cookie))
+			results <- outcome{result: result, err: err}
+		}(p)
+	}
+	wg.Wait()
+	close(results)
+	var recovered *idp.HTTPLoginResult
+	winners, userIDs := 0, map[string]bool{}
+	for got := range results {
+		if got.err != nil {
+			continue
+		}
+		if got.result == nil || got.result.Identity == nil || got.result.Identity.Subject != "subject-recover" || got.result.ExternalIdentity.Evidence.UserID == "" || got.result.Cookie == nil || got.result.Cookie.MaxAge != -1 {
+			t.Fatal("recovered ticket published an incomplete result")
+		}
+		winners++
+		userIDs[got.result.ExternalIdentity.Evidence.UserID] = true
+		recovered = got.result
+	}
+	if winners != 1 || len(userIDs) != 1 || recovered == nil {
+		t.Fatalf("recovered ticket produced %d successful results with %d identities", winners, len(userIDs))
+	}
+	// Once the attachment result is committed, the ticket is spent. Concurrent
+	// or later callbacks cannot publish a second success page.
+	if replay, err := winner.Login(t.Context(), request(query, begin.Cookie)); !errors.Is(err, ErrDenied) || replay != nil {
+		t.Fatal("completed ticket accepted a second successful callback", err)
+	}
+	// A retryable attachment failure still belongs to the consumed ticket, so
+	// the trusted application cannot issue that state again.
+	if _, err := peer.Issue(t.Context(), state, &idp.LoginIdentity{Subject: "another", Roles: []string{"authp/user"}}); !errors.Is(err, ErrDenied) {
+		t.Fatal("retryable consumed state accepted reissue", err)
 	}
 }

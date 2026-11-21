@@ -40,6 +40,15 @@ type ticket struct {
 	Browser, Credential    [32]byte
 	Expires, TicketExpires int64
 	Identity               *idp.LoginIdentity
+	// Consumed marks the browser callback which owns this ticket's one-time
+	// authentication attempt. The entry remains while the attachment is pending
+	// or retryable, so concurrent callbacks cannot create a second authentication
+	// result.
+	Consumed bool
+	// AttachmentFailed records that the owning browser may retry this exact
+	// callback after the attachment backend becomes available. A retry atomically
+	// reclaims the same consumed entry; no other browser can take it over.
+	AttachmentFailed bool
 }
 type document struct {
 	Version, Capacity int
@@ -65,6 +74,9 @@ func (p *Provider) valid(d *document) error {
 	}
 	for _, t := range d.Tickets {
 		if t.Expires <= 0 || t.Identity != nil && (t.Identity.Validate() != nil || t.TicketExpires <= 0 || t.TicketExpires > t.Expires) {
+			return consulstate.ErrUnavailable
+		}
+		if (t.Consumed && (t.Identity == nil || t.TicketExpires <= 0)) || (t.AttachmentFailed && !t.Consumed) {
 			return consulstate.ErrUnavailable
 		}
 	}
@@ -216,33 +228,73 @@ func (p *Provider) Login(ctx context.Context, r *http.Request) (*idp.HTTPLoginRe
 	digest := sha256.Sum256([]byte(values.Get("state")))
 	credential := sha256.Sum256([]byte(values.Get("ticket")))
 	binding := sha256.Sum256([]byte(browser))
-	var identity idp.LoginIdentity
-	var deadline int64
+	var claim ticket
 	err = p.run(ctx, func(d *document) (bool, error) {
 		t, ok := d.Tickets[digest]
 		now := time.Now().Unix()
 		if !ok || t.Identity == nil || now >= t.Expires || now >= t.TicketExpires || t.Credential != credential || t.Browser != binding {
 			return false, ErrDenied
 		}
-		identity = *t.Identity
-		identity.Roles = append([]string(nil), t.Identity.Roles...)
-		deadline = t.TicketExpires
-		delete(d.Tickets, digest)
+		if t.Consumed && !t.AttachmentFailed {
+			// Another callback already owns the one-time attempt. Its attachment
+			// result is not known yet, so this request must not publish a page.
+			return false, ErrDenied
+		}
+		t.Consumed = true
+		t.AttachmentFailed = false
+		d.Tickets[digest] = t
+		claim = t
 		return true, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	if time.Now().Unix() >= deadline {
+	if time.Now().Unix() >= claim.TicketExpires {
 		return nil, ErrDenied
 	}
+	identity := *claim.Identity
+	identity.Roles = append([]string(nil), claim.Identity.Roles...)
 	rr := requests.NewRequest()
 	rr.ExternalIdentity = requests.ExternalIdentity{Issuer: p.config.IssuerURL, Subject: identity.Subject}
 	rr.Response.Payload = map[string]any{"email": identity.Email, "name": identity.Name}
 	if err := p.attachment.Authenticate(ctx, rr, p.GetName(), p.GetKind()); err != nil {
+		if commitErr := p.failAttachment(context.WithoutCancel(ctx), digest, claim); commitErr != nil {
+			return nil, commitErr
+		}
+		return nil, err
+	}
+	if err := p.completeAttachment(context.WithoutCancel(ctx), digest, claim); err != nil {
 		return nil, err
 	}
 	return &idp.HTTPLoginResult{Identity: &identity, ExternalIdentity: rr.ExternalIdentity, Cookie: p.cookie("", true)}, nil
+}
+
+// failAttachment keeps the ticket claimed by the browser which won the
+// one-time attempt, while making that same callback retryable.
+func (p *Provider) failAttachment(ctx context.Context, digest [32]byte, claim ticket) error {
+	return p.run(ctx, func(d *document) (bool, error) {
+		current, ok := d.Tickets[digest]
+		if !ok || !current.Consumed || current.AttachmentFailed || current.Browser != claim.Browser || current.Credential != claim.Credential {
+			return false, ErrDenied
+		}
+		current.AttachmentFailed = true
+		d.Tickets[digest] = current
+		return true, nil
+	})
+}
+
+// completeAttachment retires the one-time ticket only after the attachment
+// result belongs to the same browser claim. A concurrent or later callback
+// therefore cannot publish a second successful authentication result.
+func (p *Provider) completeAttachment(ctx context.Context, digest [32]byte, claim ticket) error {
+	return p.run(ctx, func(d *document) (bool, error) {
+		current, ok := d.Tickets[digest]
+		if !ok || !current.Consumed || current.AttachmentFailed || current.Browser != claim.Browser || current.Credential != claim.Credential {
+			return false, ErrDenied
+		}
+		delete(d.Tickets, digest)
+		return true, nil
+	})
 }
 
 // GetName returns the configured instance name.
